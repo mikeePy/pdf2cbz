@@ -18,3 +18,4 @@ build/pdf_to_jpg/PYZ-00.toc
 build/pdf_to_jpg/warn-pdf_to_jpg.txt
 build/pdf_to_jpg/xref-pdf_to_jpg.html
 dist/pdf_to_jpg.exe
+dist/pdf_to_cbz.exe
