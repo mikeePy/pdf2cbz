@@ -22,6 +22,12 @@ except ImportError:
     _RootClass = tk.Tk
 
 
+# ---- module-level constants ----
+MAX_HEIGHT_PX = 1500        # hard cap on rendered image height
+MAX_WIDTH_PX = 3000         # hard cap on rendered image width
+MAX_PIXELS = 4_000_000      # hard cap on total pixels (~12 MB RGB pixmap)
+
+
 # ---- top-level helpers (must be importable by child processes) ----
 def _page_native_dpi(page, min_cover=0.80):
     """If a single embedded image covers >= min_cover of the page, return
@@ -66,54 +72,194 @@ def _page_native_dpi(page, min_cover=0.80):
 
 
 def _render_chunk(args):
-    """Render a chunk of pages. Runs in a child process."""
+    """Render a chunk of pages. Runs in a child process.
+
+    Returns a list of 10-tuples, one per page in the chunk:
+        (index, jpg_path_or_None, w, h, eff_dpi,
+         native_dpi, src_w, src_h, cap_str, error_or_None)
+
+    cap_str is "" if no cap applied, otherwise e.g.
+    "height≤1500, width≤3000, pixels≤4M".
+    """
     (pdf_path, password, chunk, workdir, dpi, quality,
      colorspace, cap_dpi) = args
     import fitz as _fitz
     cs = _fitz.csGRAY if colorspace == "gray" else _fitz.csRGB
 
-    doc = _fitz.open(pdf_path)
+    cap_labels = {
+        "height": f"height≤{MAX_HEIGHT_PX}",
+        "width": f"width≤{MAX_WIDTH_PX}",
+        "pixels": f"pixels≤{MAX_PIXELS // 1_000_000}M",
+    }
+
+    results = []
+    doc = None
     try:
+        doc = _fitz.open(pdf_path)
         if password and doc.needs_pass:
             if not doc.authenticate(password):
                 raise RuntimeError("Incorrect password")
-        out = []
+
         for i in chunk:
-            page = doc.load_page(i)
-            eff_dpi = dpi
-            native_dpi = None
-            src_w = src_h = None
-            if cap_dpi:
-                native = _page_native_dpi(page)
-                if native is not None:
-                    native_dpi, src_w, src_h = native
-                    if native_dpi < dpi:
-                        eff_dpi = max(1, int(native_dpi))
-            eff_dpi = int(eff_dpi)
-            pix = page.get_pixmap(dpi=eff_dpi, alpha=False, colorspace=cs)
-            fname = f"page_{i + 1:04d}.jpg"
-            fpath = os.path.join(workdir, fname)
-            pix.save(fpath, jpg_quality=quality)
-            out.append(
-                (i, fpath, pix.width, pix.height,
-                 eff_dpi, native_dpi, src_w, src_h)
-            )
-        return out
+            try:
+                page = doc.load_page(i)
+                target_dpi = int(dpi)
+                native_dpi = None
+                src_w = src_h = None
+                caps = set()
+
+                # 1) optional per-page cap to source image resolution
+                if cap_dpi:
+                    native = _page_native_dpi(page)
+                    if native is not None:
+                        native_dpi, src_w, src_h = native
+                        if native_dpi < target_dpi:
+                            target_dpi = max(1, int(native_dpi))
+
+                page_w_pt = max(0.0, page.rect.width or 0.0)
+                page_h_pt = max(0.0, page.rect.height or 0.0)
+
+                dpi_final = target_dpi
+
+                # 2) pre-render caps
+                if page_h_pt > 0:
+                    m = (MAX_HEIGHT_PX * 72.0) / page_h_pt
+                    if dpi_final > m:
+                        dpi_final = max(1, int(m))
+                        caps.add("height")
+                if page_w_pt > 0:
+                    m = (MAX_WIDTH_PX * 72.0) / page_w_pt
+                    if dpi_final > m:
+                        dpi_final = max(1, int(m))
+                        caps.add("width")
+                if page_w_pt > 0 and page_h_pt > 0:
+                    m = math.sqrt(MAX_PIXELS * 72.0 * 72.0 /
+                                  (page_w_pt * page_h_pt))
+                    if dpi_final > m:
+                        dpi_final = max(1, int(m))
+                        caps.add("pixels")
+
+                dpi_final = max(1, int(dpi_final))
+
+                # 3) render with retry-on-failure (halve dpi up to 4 times)
+                attempts = [dpi_final]
+                cur = dpi_final
+                for _ in range(4):
+                    cur = max(36, cur // 2)
+                    if cur >= dpi_final or cur < 36:
+                        break
+                    attempts.append(cur)
+
+                pix = None
+                last_err = None
+                for attempt_dpi in attempts:
+                    try:
+                        pix = page.get_pixmap(
+                            dpi=attempt_dpi, alpha=False, colorspace=cs
+                        )
+                        if attempt_dpi != dpi_final:
+                            caps.add("retry")
+                        dpi_final = attempt_dpi
+                        break
+                    except Exception as e:
+                        last_err = e
+                        pix = None
+                        continue
+
+                if pix is None:
+                    results.append(
+                        (i, None, 0, 0, int(dpi),
+                         native_dpi, src_w, src_h, "",
+                         f"page {i + 1}: render failed after retries: "
+                         f"{last_err}")
+                    )
+                    continue
+
+                # 4) post-render safety loop: re-render if any cap violated
+                safety = 0
+                while safety < 6 and dpi_final > 1:
+                    over_h = pix.height > MAX_HEIGHT_PX
+                    over_w = pix.width > MAX_WIDTH_PX
+                    over_p = (pix.width * pix.height) > MAX_PIXELS
+                    if not (over_h or over_w or over_p):
+                        break
+                    factors = []
+                    if over_h:
+                        factors.append(MAX_HEIGHT_PX / pix.height)
+                        caps.add("height")
+                    if over_w:
+                        factors.append(MAX_WIDTH_PX / pix.width)
+                        caps.add("width")
+                    if over_p:
+                        factors.append(
+                            math.sqrt(MAX_PIXELS / (pix.width * pix.height))
+                        )
+                        caps.add("pixels")
+                    factor = min(factors)
+                    new_dpi = max(1, int(dpi_final * factor))
+                    if new_dpi >= dpi_final:
+                        new_dpi = dpi_final - 1
+                    dpi_final = new_dpi
+                    try:
+                        pix = page.get_pixmap(
+                            dpi=dpi_final, alpha=False, colorspace=cs
+                        )
+                    except Exception:
+                        pix = None
+                        break
+                    safety += 1
+
+                if pix is None:
+                    results.append(
+                        (i, None, 0, 0, int(dpi),
+                         native_dpi, src_w, src_h, "",
+                         f"page {i + 1}: render failed in safety loop")
+                    )
+                    continue
+
+                fname = f"page_{i + 1:04d}.jpg"
+                fpath = os.path.join(workdir, fname)
+                pix.save(fpath, jpg_quality=quality)
+                cap_str = ", ".join(
+                    cap_labels[k] if k in cap_labels else "retry"
+                    for k in ("height", "width", "pixels", "retry")
+                    if k in caps
+                )
+                results.append(
+                    (i, fpath, pix.width, pix.height, dpi_final,
+                     native_dpi, src_w, src_h, cap_str, None)
+                )
+            except Exception as e:
+                results.append(
+                    (i, None, 0, 0, int(dpi),
+                     None, None, None, "", f"page {i + 1}: {e}")
+                )
+    except Exception as e:
+        first = chunk[0] if chunk else 0
+        results.append(
+            (first, None, 0, 0, int(dpi),
+             None, None, None, "", f"worker: {e}")
+        )
     finally:
-        doc.close()
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
+    return results
 
 
 class PDFtoJPGApp(_RootClass):
     def __init__(self):
         super().__init__()
         self.title("PDF → CBZ Queue Converter")
-        self.geometry("820x760")
-        self.minsize(700, 640)
+        self.geometry("820x800")
+        self.minsize(700, 680)
 
         self.out_dir = tk.StringVar()
         self.temp_dir = tk.StringVar()
         self.dpi = tk.IntVar(value=200)
-        self.quality = tk.IntVar(value=60)      # lowered from 82 → 70
+        self.quality = tk.IntVar(value=60)
         self.workers = tk.IntVar(value=min(os.cpu_count() or 2, 8))
         self.grayscale = tk.BooleanVar(value=False)
         self.cap_dpi = tk.BooleanVar(value=True)
@@ -172,7 +318,7 @@ class PDFtoJPGApp(_RootClass):
         self.tree.heading("status", text="Status")
         self.tree.column("file", width=280, anchor="w")
         self.tree.column("folder", width=300, anchor="w")
-        self.tree.column("status", width=200, anchor="w")
+        self.tree.column("status", width=220, anchor="w")
         self.tree.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
         sb = ttk.Scrollbar(frm_q, command=self.tree.yview)
         sb.pack(side="left", fill="y", pady=6)
@@ -257,7 +403,7 @@ class PDFtoJPGApp(_RootClass):
         ).pack(side="left")
 
         row2 = ttk.Frame(frm_opt)
-        row2.pack(fill="x", padx=6, pady=(2, 6))
+        row2.pack(fill="x", padx=6, pady=(2, 2))
         ttk.Checkbutton(
             row2,
             text="Grayscale  (≈2–3× smaller for B&W scans)",
@@ -268,6 +414,15 @@ class PDFtoJPGApp(_RootClass):
             text="Cap DPI to source image resolution  (per page)",
             variable=self.cap_dpi,
         ).pack(side="left", padx=(24, 0))
+
+        ttk.Label(
+            frm_opt,
+            text=f"Image caps per page: height ≤ {MAX_HEIGHT_PX}px, "
+                 f"width ≤ {MAX_WIDTH_PX}px, "
+                 f"total ≤ {MAX_PIXELS // 1_000_000}M pixels  "
+                 f"(aspect ratio always preserved)",
+            foreground="#666",
+        ).pack(anchor="w", padx=6, pady=(0, 6))
 
         # --- Convert / Cancel ---
         frm_act = ttk.Frame(self)
@@ -347,7 +502,6 @@ class PDFtoJPGApp(_RootClass):
         self.status.set(f"Queue size: {len(self._row_to_path)}")
 
     def _clear_queue(self):
-        """Empty the queue and reset the log / progress / status."""
         if self._converting:
             return
         for row in self.tree.get_children():
@@ -464,16 +618,23 @@ class PDFtoJPGApp(_RootClass):
                         self._ui(upd)
 
                     try:
-                        cbz = self._convert_one(
+                        cbz, skipped = self._convert_one(
                             pdf, out, dpi, quality, temp_root, workers, ex,
                             colorspace, cap_dpi,
                             log=log_cb,
                             set_progress=progress_cb,
                             ask_password=self._ask_password_threadsafe,
                         )
+                        if skipped:
+                            status_txt = (
+                                f"Done ({skipped} p. skipped) → "
+                                f"{os.path.basename(cbz)}"
+                            )
+                        else:
+                            status_txt = f"Done → {os.path.basename(cbz)}"
                         self._ui(
-                            lambda r=row, c=os.path.basename(cbz):
-                            self.tree.set(r, "status", f"Done → {c}")
+                            lambda r=row, s=status_txt:
+                            self.tree.set(r, "status", s)
                         )
                     except Exception as e:
                         if self._cancel_requested:
@@ -537,6 +698,12 @@ class PDFtoJPGApp(_RootClass):
         colorspace, cap_dpi,
         log, set_progress, ask_password,
     ):
+        """Convert one PDF to a CBZ.
+
+        Returns (cbz_path, skipped_page_count). Skipped pages are those that
+        failed to render even after retries — the CBZ is still produced with
+        the remaining pages.
+        """
         created_files = []
         workdir = None
         workdir_created_here = False
@@ -554,6 +721,9 @@ class PDFtoJPGApp(_RootClass):
 
             log(f"Temp folder: {workdir}")
             log(f"Workers:     {workers}")
+            log(f"Image caps:  height≤{MAX_HEIGHT_PX}px, "
+                f"width≤{MAX_WIDTH_PX}px, "
+                f"pixels≤{MAX_PIXELS // 1_000_000}M")
 
             probe = fitz.open(pdf)
             password = None
@@ -583,13 +753,11 @@ class PDFtoJPGApp(_RootClass):
             pages = list(range(total))
             if workers <= 1 or total <= 1:
                 chunks = [pages]
-                workers_local = 1
             else:
                 chunk_size = max(1, math.ceil(total / (workers * 4)))
                 chunks = [
                     pages[i:i + chunk_size] for i in range(0, total, chunk_size)
                 ]
-                workers_local = workers
 
             args_list = [
                 (pdf, password, chunk, workdir, dpi, quality,
@@ -599,6 +767,7 @@ class PDFtoJPGApp(_RootClass):
 
             page_path = {}
             done = 0
+            page_errors = []
             futures = {executor.submit(_render_chunk, a): a[2] for a in args_list}
             try:
                 for fut in as_completed(futures):
@@ -607,48 +776,66 @@ class PDFtoJPGApp(_RootClass):
                             f.cancel()
                         raise RuntimeError("Cancelled by user")
                     res = fut.result()
-                    for item in res:
-                        i, fpath = item[0], item[1]
+
+                    # tuple: (i, fpath, w, h, eff_dpi,
+                    #         native_dpi, src_w, src_h, cap_str, err)
+                    for (i, fpath, w, h, eff_dpi,
+                         native_dpi, src_w, src_h,
+                         cap_str, err) in res:
+                        if err is not None:
+                            page_errors.append(err)
+                            log(f"  [{i + 1}/{total}] SKIPPED — {err}")
+                            continue
                         page_path[i] = fpath
                         created_files.append(fpath)
-                    done += len(res)
+                        done += 1
+
+                        info = (
+                            f"  [{i + 1}/{total}] "
+                            f"{os.path.basename(fpath)}  ({w}x{h})  "
+                            f"@{eff_dpi} DPI"
+                        )
+                        parts = []
+                        if native_dpi is not None:
+                            parts.append(
+                                f"source {src_w}×{src_h} ≈{native_dpi:.0f} DPI"
+                            )
+                        if cap_str:
+                            parts.append(cap_str)
+                        if parts:
+                            info += "  [" + "; ".join(parts) + "]"
+                        log(info)
                     set_progress(done, total)
 
-                    for (i, fpath, w, h, eff_dpi,
-                         native_dpi, src_w, src_h) in res:
-                        base_info = (
-                            f"  [{i + 1}/{total}] "
-                            f"{os.path.basename(fpath)}  ({w}x{h})"
-                        )
-                        if native_dpi is not None:
-                            if eff_dpi < dpi:
-                                base_info += (
-                                    f"  @{eff_dpi:.0f} DPI "
-                                    f"(capped from {dpi}; source "
-                                    f"{src_w}×{src_h} ≈{native_dpi:.0f} DPI)"
-                                )
-                            else:
-                                base_info += (
-                                    f"  @{eff_dpi:.0f} DPI "
-                                    f"(source {src_w}×{src_h} "
-                                    f"≈{native_dpi:.0f} DPI)"
-                                )
-                        else:
-                            base_info += f"  @{eff_dpi:.0f} DPI"
-                        log(base_info)
+                if page_errors and done == 0:
+                    for f in futures:
+                        f.cancel()
+                    raise RuntimeError(
+                        f"All {len(page_errors)} page(s) failed — "
+                        f"first: {page_errors[0]}"
+                    )
+            except RuntimeError:
+                raise
             except Exception:
                 for f in futures:
                     f.cancel()
                 raise
 
+            if page_errors:
+                log("-" * 60)
+                log(
+                    f"WARNING: {len(page_errors)} of {total} page(s) skipped — "
+                    f"CBZ will be produced with {done} page(s)."
+                )
+
             log("-" * 60)
             log(f"Packing CBZ: {cbz_path}")
             with zipfile.ZipFile(cbz_path, "w", zipfile.ZIP_STORED) as zf:
-                for i in range(total):
+                for i in sorted(page_path.keys()):
                     fpath = page_path[i]
                     zf.write(fpath, arcname=os.path.basename(fpath))
 
-            return cbz_path
+            return (cbz_path, len(page_errors))
         finally:
             deleted = 0
             for fpath in created_files:
